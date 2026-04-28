@@ -1,3 +1,9 @@
+# Use the git CLI for fetches so global URL rewrites + gh-auth are honored
+# (otherwise cargo defaults to SSH-agent auth and fails to fetch the lance
+# fork during maturin wheel builds).
+[net]
+git-fetch-with-cli = true
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
