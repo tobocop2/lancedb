@@ -7,6 +7,12 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    error::PythonErrorExt,
+    namespace::{create_namespace_storage_options_provider, extract_namespace_arc},
+    runtime::future_into_py,
+    table::Table,
+};
 use arrow::{datatypes::Schema, ffi_stream::ArrowArrayStreamReader, pyarrow::FromPyArrow};
 use lancedb::{
     connection::Connection as LanceConnection,
@@ -19,13 +25,6 @@ use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     pyclass, pyfunction, pymethods,
     types::{PyDict, PyDictMethods},
-};
-use pyo3_async_runtimes::tokio::future_into_py;
-
-use crate::{
-    error::PythonErrorExt,
-    namespace::{create_namespace_storage_options_provider, extract_namespace_arc},
-    table::Table,
 };
 
 #[pyclass]
@@ -396,12 +395,17 @@ impl Connection {
         future_into_py(py, async move {
             use lance_namespace::models::CreateNamespaceRequest;
             // Mode is now a string field
-            let mode_str = mode.and_then(|m| match m.to_lowercase().as_str() {
-                "create" => Some("Create".to_string()),
-                "exist_ok" => Some("ExistOk".to_string()),
-                "overwrite" => Some("Overwrite".to_string()),
-                _ => None,
-            });
+            let mode_str = mode
+                .map(|m| match m.to_lowercase().as_str() {
+                    "create" => Ok("Create".to_string()),
+                    "exist_ok" => Ok("ExistOk".to_string()),
+                    "overwrite" => Ok("Overwrite".to_string()),
+                    _ => Err(PyValueError::new_err(format!(
+                        "Invalid mode {:?}: expected one of 'create', 'exist_ok', 'overwrite'",
+                        m
+                    ))),
+                })
+                .transpose()?;
             let request = CreateNamespaceRequest {
                 id: Some(namespace_path),
                 mode: mode_str,
@@ -429,16 +433,26 @@ impl Connection {
         future_into_py(py, async move {
             use lance_namespace::models::DropNamespaceRequest;
             // Mode and Behavior are now string fields
-            let mode_str = mode.and_then(|m| match m.to_uppercase().as_str() {
-                "SKIP" => Some("Skip".to_string()),
-                "FAIL" => Some("Fail".to_string()),
-                _ => None,
-            });
-            let behavior_str = behavior.and_then(|b| match b.to_uppercase().as_str() {
-                "RESTRICT" => Some("Restrict".to_string()),
-                "CASCADE" => Some("Cascade".to_string()),
-                _ => None,
-            });
+            let mode_str = mode
+                .map(|m| match m.to_uppercase().as_str() {
+                    "SKIP" => Ok("Skip".to_string()),
+                    "FAIL" => Ok("Fail".to_string()),
+                    _ => Err(PyValueError::new_err(format!(
+                        "Invalid mode {:?}: expected one of 'skip', 'fail'",
+                        m
+                    ))),
+                })
+                .transpose()?;
+            let behavior_str = behavior
+                .map(|b| match b.to_uppercase().as_str() {
+                    "RESTRICT" => Ok("Restrict".to_string()),
+                    "CASCADE" => Ok("Cascade".to_string()),
+                    _ => Err(PyValueError::new_err(format!(
+                        "Invalid behavior {:?}: expected one of 'restrict', 'cascade'",
+                        b
+                    ))),
+                })
+                .transpose()?;
             let request = DropNamespaceRequest {
                 id: Some(namespace_path),
                 mode: mode_str,
@@ -525,7 +539,7 @@ impl Connection {
 }
 
 #[pyfunction]
-#[pyo3(signature = (uri, api_key=None, region=None, host_override=None, read_consistency_interval=None, client_config=None, storage_options=None, session=None))]
+#[pyo3(signature = (uri, api_key=None, region=None, host_override=None, read_consistency_interval=None, client_config=None, storage_options=None, session=None, manifest_enabled=false, namespace_client_properties=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn connect(
     py: Python<'_>,
@@ -537,6 +551,8 @@ pub fn connect(
     client_config: Option<PyClientConfig>,
     storage_options: Option<HashMap<String, String>>,
     session: Option<crate::session::Session>,
+    manifest_enabled: bool,
+    namespace_client_properties: Option<HashMap<String, String>>,
 ) -> PyResult<Bound<'_, PyAny>> {
     future_into_py(py, async move {
         let mut builder = lancedb::connect(&uri);
@@ -555,6 +571,12 @@ pub fn connect(
         }
         if let Some(storage_options) = storage_options {
             builder = builder.storage_options(storage_options);
+        }
+        if manifest_enabled {
+            builder = builder.manifest_enabled(true);
+        }
+        if let Some(namespace_client_properties) = namespace_client_properties {
+            builder = builder.namespace_client_properties(namespace_client_properties);
         }
         #[cfg(feature = "remote")]
         if let Some(client_config) = client_config {

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use lance::dataset::ReadParams;
+use lance::dataset::refs::MAIN_BRANCH;
 use lance_namespace::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, DescribeNamespaceRequest,
     DescribeNamespaceResponse, DropNamespaceRequest, DropNamespaceResponse, ListNamespacesRequest,
@@ -119,6 +120,8 @@ pub struct OpenTableBuilder {
     parent: Arc<dyn Database>,
     request: OpenTableRequest,
     embedding_registry: Arc<dyn EmbeddingRegistry>,
+    branch: Option<String>,
+    version: Option<u64>,
 }
 
 impl OpenTableBuilder {
@@ -139,6 +142,8 @@ impl OpenTableBuilder {
                 managed_versioning: None,
             },
             embedding_registry,
+            branch: None,
+            version: None,
         }
     }
 
@@ -259,14 +264,48 @@ impl OpenTableBuilder {
         self
     }
 
+    /// Open the table scoped to the given branch instead of the default branch.
+    ///
+    /// Reads and writes on the returned table operate in the branch's context.
+    pub fn branch(mut self, branch: impl Into<String>) -> Self {
+        self.branch = Some(branch.into());
+        self
+    }
+
+    /// Open the table pinned to a specific version, producing a read-only "view".
+    ///
+    /// Composes with [`Self::branch`]: when a branch is also set, this opens that
+    /// branch at the given version; otherwise it opens `main` at that version.
+    /// The returned table is a detached head, so operations that modify the table
+    /// will fail until [`Table::checkout_latest`] is called.
+    ///
+    /// ```
+    /// # use lancedb::Connection;
+    /// # async fn f(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let table = conn.open_table("t").branch("exp").version(3).execute().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn version(mut self, version: u64) -> Self {
+        self.version = Some(version);
+        self
+    }
+
     /// Open the table
     pub async fn execute(self) -> Result<Table> {
         let table = self.parent.open_table(self.request).await?;
-        Ok(Table::new_with_embedding_registry(
-            table,
-            self.parent,
-            self.embedding_registry,
-        ))
+        let table = Table::new_with_embedding_registry(table, self.parent, self.embedding_registry);
+        // "main" is the default branch, so treat it as no branch.
+        let branch = self.branch.filter(|b| b.as_str() != MAIN_BRANCH);
+        match branch {
+            Some(branch) => table.checkout_branch(&branch, self.version).await,
+            None => {
+                if let Some(version) = self.version {
+                    table.checkout(version).await?;
+                }
+                Ok(table)
+            }
+        }
     }
 }
 
@@ -590,6 +629,15 @@ pub struct ConnectRequest {
     /// storage options.
     pub namespace_client_properties: HashMap<String, String>,
 
+    /// Use directory namespace manifests as the source of truth for native
+    /// LanceDB table metadata.
+    ///
+    /// When enabled for a local/native connection, LanceDB returns a
+    /// namespace-backed database directly. Directory listing fallback remains
+    /// enabled for migration, and directory-listing-to-manifest migration is
+    /// forced on.
+    pub manifest_enabled: bool,
+
     /// The interval at which to check for updates from other processes.
     ///
     /// If None, then consistency is not checked. For performance
@@ -630,6 +678,7 @@ impl ConnectBuilder {
                 read_consistency_interval: None,
                 options: HashMap::new(),
                 namespace_client_properties: HashMap::new(),
+                manifest_enabled: false,
                 session: None,
             },
             embedding_registry: None,
@@ -791,8 +840,18 @@ impl ConnectBuilder {
         self
     }
 
-    /// The interval at which to check for updates from other processes. This
-    /// only affects LanceDB OSS.
+    /// Enable or disable manifest-backed directory namespace mode for local
+    /// native connections.
+    ///
+    /// When enabled, the connection uses the directory namespace database
+    /// directly for all table operations and forces
+    /// `dir_listing_to_manifest_migration_enabled=true`.
+    pub fn manifest_enabled(mut self, enabled: bool) -> Self {
+        self.request.manifest_enabled = enabled;
+        self
+    }
+
+    /// The interval at which to check for updates from other processes.
     ///
     /// If left unset, consistency is not checked. For maximum read
     /// performance, this is the default. For strong consistency, set this to
@@ -804,8 +863,11 @@ impl ConnectBuilder {
     /// This only affects read operations. Write operations are always
     /// consistent.
     ///
-    /// LanceDB Cloud uses eventual consistency under the hood, and is not
-    /// currently configurable.
+    /// # Cost
+    ///
+    /// Stronger consistency is not free. The smaller the interval, the more
+    /// often each read pays the cost of checking for updates against object
+    /// storage, raising per-read latency and cost.
     pub fn read_consistency_interval(
         mut self,
         read_consistency_interval: std::time::Duration,
@@ -865,6 +927,7 @@ impl ConnectBuilder {
             options.host_override,
             self.request.client_config,
             storage_options.into(),
+            self.request.read_consistency_interval,
         )?);
         Ok(Connection {
             internal,
@@ -886,6 +949,16 @@ impl ConnectBuilder {
     pub async fn execute(self) -> Result<Connection> {
         if self.request.uri.starts_with("db") {
             self.execute_remote()
+        } else if self.request.manifest_enabled {
+            let internal = Arc::new(
+                ListingDatabase::connect_manifest_enabled_namespace_database(&self.request).await?,
+            );
+            Ok(Connection {
+                internal,
+                embedding_registry: self
+                    .embedding_registry
+                    .unwrap_or_else(|| Arc::new(MemoryRegistry::new())),
+            })
         } else {
             let internal = Arc::new(ListingDatabase::connect_with_options(&self.request).await?);
             Ok(Connection {
@@ -1132,6 +1205,9 @@ mod tests {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use tempfile::tempdir;
 
+    use crate::database::listing::{ListingDatabaseOptions, OPT_NEW_TABLE_V2_MANIFEST_PATHS};
+    use crate::database::namespace::LanceNamespaceDatabase;
+    use crate::table::NativeTable;
     use crate::test_utils::connection::new_test_connection;
 
     use super::*;
@@ -1202,6 +1278,147 @@ mod tests {
             properties.get("manifest_enabled"),
             Some(&"true".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_manifest_enabled_uses_directory_namespace() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri)
+            .manifest_enabled(true)
+            .storage_option("timeout", "30s")
+            .namespace_client_property("manifest_enabled", "false")
+            .namespace_client_property("dir_listing_to_manifest_migration_enabled", "false")
+            .execute()
+            .await
+            .unwrap();
+
+        assert!(
+            db.database()
+                .as_any()
+                .downcast_ref::<LanceNamespaceDatabase>()
+                .is_some()
+        );
+        assert_eq!(db.uri(), uri);
+
+        let (ns_impl, properties) = db.namespace_client_config().await.unwrap();
+        assert_eq!(ns_impl, "dir");
+        assert_eq!(properties.get("root"), Some(&uri.to_string()));
+        assert_eq!(
+            properties.get("manifest_enabled"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            properties.get("dir_listing_to_manifest_migration_enabled"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(properties.get("storage.timeout"), Some(&"30s".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_enabled_rejects_commit_engine_uri() {
+        let Err(err) = connect("s3+ddb://bucket/db?ddbTableName=manifest")
+            .manifest_enabled(true)
+            .execute()
+            .await
+        else {
+            panic!("expected manifest-enabled s3+ddb connection to fail");
+        };
+        assert!(
+            matches!(err, Error::NotSupported { message } if message.contains("commit engine URI schemes"))
+        );
+
+        let Err(err) = connect("s3://bucket/db?engine=ddb&ddbTableName=manifest")
+            .manifest_enabled(true)
+            .execute()
+            .await
+        else {
+            panic!("expected manifest-enabled engine query connection to fail");
+        };
+        assert!(
+            matches!(err, Error::NotSupported { message } if message.contains("commit engine"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_enabled_connection_migrates_root_listing_table() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+
+        connect(uri)
+            .execute()
+            .await
+            .unwrap()
+            .create_empty_table("legacy", schema)
+            .execute()
+            .await
+            .unwrap();
+
+        let db = connect(uri).manifest_enabled(true).execute().await.unwrap();
+        let tables = db.table_names().execute().await.unwrap();
+        assert_eq!(tables, vec!["legacy".to_string()]);
+        db.open_table("legacy").execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_manifest_enabled_preserves_new_table_options() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let options = ListingDatabaseOptions::builder()
+            .enable_v2_manifest_paths(true)
+            .build();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+
+        let table = connect(uri)
+            .manifest_enabled(true)
+            .database_options(&options)
+            .execute()
+            .await
+            .unwrap()
+            .create_empty_table("v1_manifest", schema)
+            .storage_option(OPT_NEW_TABLE_V2_MANIFEST_PATHS, "false")
+            .execute()
+            .await
+            .unwrap();
+
+        let native_table = table
+            .base_table()
+            .as_any()
+            .downcast_ref::<NativeTable>()
+            .unwrap();
+        assert!(!native_table.uses_v2_manifest_paths().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_enabled_vend_input_storage_options() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+
+        let table = connect(uri)
+            .manifest_enabled(true)
+            .storage_option("test_storage_option", "test_value")
+            .namespace_client_property("vend_input_storage_options", "true")
+            .namespace_client_property(
+                "vend_input_storage_options_refresh_interval_millis",
+                "60000",
+            )
+            .execute()
+            .await
+            .unwrap()
+            .create_empty_table("vended", schema)
+            .execute()
+            .await
+            .unwrap();
+
+        let storage_options = table.latest_storage_options().await.unwrap().unwrap();
+        assert_eq!(
+            storage_options.get("test_storage_option"),
+            Some(&"test_value".to_string())
+        );
+        assert!(storage_options.contains_key("expires_at_millis"));
     }
 
     #[tokio::test]

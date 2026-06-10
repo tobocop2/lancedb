@@ -11,6 +11,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_namespace::{
     LanceNamespace,
+    error::{ErrorCode, NamespaceError},
     models::{
         CreateNamespaceRequest, CreateNamespaceResponse, DeclareTableRequest,
         DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
@@ -24,14 +25,31 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 
 use crate::connection::NamespaceClientPushdownOperation;
 use crate::database::ReadConsistency;
+use crate::database::listing::{
+    NewTableConfig, OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS, OPT_NEW_TABLE_STORAGE_VERSION,
+    OPT_NEW_TABLE_V2_MANIFEST_PATHS,
+};
 use crate::error::{Error, Result};
-use crate::table::NativeTable;
+use crate::table::{NativeTable, map_namespace_lance_error};
 use lance::dataset::WriteMode;
 
 use super::{
     BaseTable, CloneTableRequest, CreateTableMode, CreateTableRequest as DbCreateTableRequest,
     Database, OpenTableRequest, TableNamesRequest,
 };
+
+/// Returns true if the given `lance::Error` (anywhere in its source chain) is a
+/// `NamespaceError::TableAlreadyExists`.
+fn is_table_already_exists_namespace_error(err: &lance::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(ns_err) = e.downcast_ref::<NamespaceError>() {
+            return ns_err.code() == ErrorCode::TableAlreadyExists;
+        }
+        current = e.source();
+    }
+    false
+}
 
 /// A database implementation that uses lance-namespace for table management
 pub struct LanceNamespaceDatabase {
@@ -50,6 +68,8 @@ pub struct LanceNamespaceDatabase {
     ns_impl: String,
     // Namespace properties used to construct the namespace client
     ns_properties: HashMap<String, String>,
+    // Options for tables created by this connection
+    new_table_config: NewTableConfig,
 }
 
 impl LanceNamespaceDatabase {
@@ -71,7 +91,13 @@ impl LanceNamespaceDatabase {
             pushdown_operations: namespace_client_pushdown_operations,
             ns_impl: namespace_client_impl,
             ns_properties: namespace_client_properties,
+            new_table_config: NewTableConfig::default(),
         }
+    }
+
+    pub(crate) fn with_uri(mut self, uri: impl Into<String>) -> Self {
+        self.uri = uri.into();
+        self
     }
 
     pub async fn connect(
@@ -81,6 +107,27 @@ impl LanceNamespaceDatabase {
         read_consistency_interval: Option<std::time::Duration>,
         session: Option<Arc<lance::session::Session>>,
         pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+    ) -> Result<Self> {
+        Self::connect_with_new_table_config(
+            ns_impl,
+            ns_properties,
+            storage_options,
+            read_consistency_interval,
+            session,
+            pushdown_operations,
+            NewTableConfig::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_new_table_config(
+        ns_impl: &str,
+        ns_properties: HashMap<String, String>,
+        storage_options: HashMap<String, String>,
+        read_consistency_interval: Option<std::time::Duration>,
+        session: Option<Arc<lance::session::Session>>,
+        pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+        new_table_config: NewTableConfig,
     ) -> Result<Self> {
         let mut builder = ConnectBuilder::new(ns_impl);
         for (key, value) in ns_properties.clone() {
@@ -102,7 +149,78 @@ impl LanceNamespaceDatabase {
             pushdown_operations,
             ns_impl: ns_impl.to_string(),
             ns_properties,
+            new_table_config,
         })
+    }
+
+    fn extract_storage_overrides(
+        &self,
+        request: &DbCreateTableRequest,
+    ) -> Result<(
+        Option<lance_encoding::version::LanceFileVersion>,
+        Option<bool>,
+        Option<bool>,
+    )> {
+        let storage_options = request
+            .write_options
+            .lance_write_params
+            .as_ref()
+            .and_then(|p| p.store_params.as_ref())
+            .and_then(|sp| sp.storage_options());
+
+        let storage_version_override = storage_options
+            .and_then(|opts| opts.get(OPT_NEW_TABLE_STORAGE_VERSION))
+            .map(|s| s.parse::<lance_encoding::version::LanceFileVersion>())
+            .transpose()?;
+
+        let v2_manifest_override = storage_options
+            .and_then(|opts| opts.get(OPT_NEW_TABLE_V2_MANIFEST_PATHS))
+            .map(|s| s.parse::<bool>())
+            .transpose()
+            .map_err(|_| Error::InvalidInput {
+                message: "enable_v2_manifest_paths must be a boolean".to_string(),
+            })?;
+
+        let stable_row_ids_override = storage_options
+            .and_then(|opts| opts.get(OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS))
+            .map(|s| s.parse::<bool>())
+            .transpose()
+            .map_err(|_| Error::InvalidInput {
+                message: "enable_stable_row_ids must be a boolean".to_string(),
+            })?;
+
+        Ok((
+            storage_version_override,
+            v2_manifest_override,
+            stable_row_ids_override,
+        ))
+    }
+
+    fn apply_new_table_config(
+        &self,
+        params: &mut lance::dataset::WriteParams,
+        request: &DbCreateTableRequest,
+    ) -> Result<()> {
+        let (storage_version_override, v2_manifest_override, stable_row_ids_override) =
+            self.extract_storage_overrides(request)?;
+
+        params.data_storage_version = storage_version_override
+            .or(params.data_storage_version)
+            .or(self.new_table_config.data_storage_version);
+
+        if let Some(enable_v2_manifest_paths) =
+            v2_manifest_override.or(self.new_table_config.enable_v2_manifest_paths)
+        {
+            params.enable_v2_manifest_paths = enable_v2_manifest_paths;
+        }
+
+        if let Some(enable_stable_row_ids) =
+            stable_row_ids_override.or(self.new_table_config.enable_stable_row_ids)
+        {
+            params.enable_stable_row_ids = enable_stable_row_ids;
+        }
+
+        Ok(())
     }
 }
 
@@ -252,13 +370,15 @@ impl Database for LanceNamespaceDatabase {
                         (loc, opts, response.managed_versioning)
                     }
                     Err(e)
-                        if matches!(request.mode, CreateTableMode::Create) && {
-                            let err_str = e.to_string();
-                            err_str.contains("already exists")
-                                || err_str.contains("TableAlreadyExists")
-                                || err_str.contains("table already exists")
-                        } =>
+                        if matches!(request.mode, CreateTableMode::Create)
+                            && is_table_already_exists_namespace_error(&e) =>
                     {
+                        // A declare conflict can either mean (a) the table was previously
+                        // *declared* but never written (in which case we should proceed and
+                        // create it), or (b) the table is fully realized (in which case the
+                        // user is creating something that already exists and we should
+                        // surface TableAlreadyExists). Disambiguate by describing the table
+                        // and checking whether it has both a version and a schema.
                         let response = self
                             .namespace
                             .describe_table(DescribeTableRequest {
@@ -266,11 +386,8 @@ impl Database for LanceNamespaceDatabase {
                                 ..Default::default()
                             })
                             .await
-                            .map_err(|describe_err| Error::Runtime {
-                                message: format!(
-                                    "Failed to describe existing declared table after declare conflict: {}",
-                                    describe_err
-                                ),
+                            .map_err(|describe_err| {
+                                map_namespace_lance_error(describe_err, &request.name)
                             })?;
 
                         if response.version.is_some() && response.schema.is_some() {
@@ -290,16 +407,19 @@ impl Database for LanceNamespaceDatabase {
                         (loc, opts, response.managed_versioning)
                     }
                     Err(e) => {
-                        return Err(Error::Runtime {
-                            message: format!("Failed to declare table: {}", e),
-                        });
+                        return Err(map_namespace_lance_error(e, &request.name));
                     }
                 }
             }
         };
 
         // Build write params with storage options and commit handler
-        let mut params = request.write_options.lance_write_params.unwrap_or_default();
+        let mut params = request
+            .write_options
+            .lance_write_params
+            .clone()
+            .unwrap_or_default();
+        self.apply_new_table_config(&mut params, &request)?;
 
         if matches!(request.mode, CreateTableMode::Overwrite) {
             params.mode = WriteMode::Overwrite;
@@ -618,6 +738,64 @@ mod tests {
             .await
             .expect("Failed to list tables");
         assert!(table_names.contains(&"test_table".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_namespace_branch_query_under_pushdown_stays_local() {
+        // With QueryTable pushdown enabled, a query on the main branch routes to
+        // the namespace server, but a branch handle must run locally: the
+        // server-side request carries no branch and would return main's rows.
+        let tmp_dir = tempdir().unwrap();
+        let root_path = tmp_dir.path().to_str().unwrap().to_string();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), root_path);
+
+        let conn = connect_namespace("dir", properties)
+            .pushdown_operation(NamespaceClientPushdownOperation::QueryTable)
+            .execute()
+            .await
+            .expect("Failed to connect to namespace");
+
+        conn.create_namespace(CreateNamespaceRequest {
+            id: Some(vec!["test_ns".into()]),
+            ..Default::default()
+        })
+        .await
+        .expect("Failed to create namespace");
+
+        // main has 5 rows
+        let table = conn
+            .create_table("ref_test", create_test_data())
+            .namespace(vec!["test_ns".into()])
+            .execute()
+            .await
+            .expect("Failed to create table");
+        let main_version = table.version().await.unwrap();
+
+        // fork a branch off main, then add 5 more rows so it differs from main
+        let branch = table
+            .create_branch("exp", main_version)
+            .await
+            .expect("Failed to create branch");
+        branch
+            .add(create_test_data())
+            .execute()
+            .await
+            .expect("Failed to append to branch");
+
+        // the branch query must run locally and see the branch's 10 rows --
+        // not get routed to the server (which carries no branch) and see main's 5
+        let results = branch
+            .query()
+            .execute()
+            .await
+            .expect("Failed to query branch")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("Failed to collect results");
+        let count: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(count, 10);
     }
 
     #[tokio::test]
@@ -977,8 +1155,120 @@ mod tests {
             .execute()
             .await;
 
-        // Verify: Should return an error
-        assert!(result.is_err());
+        // Verify: Should return TableNotFound — not a generic Runtime/internal error
+        // (regression test for ENT-1235: open_table on missing table previously surfaced as
+        // a generic 500/Runtime error rather than TableNotFound).
+        match result {
+            Err(Error::TableNotFound { name, .. }) => {
+                assert_eq!(name, "non_existent_table");
+            }
+            Err(other) => panic!("Expected TableNotFound, got: {:?}", other),
+            Ok(_) => panic!("Expected open_table to fail, but it succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_namespace_open_table_not_found_at_root() {
+        // Same as above, but at the root namespace (no parent namespace creation).
+        // Covers the common code path used by `db.open_table("foo")` without a namespace.
+        let tmp_dir = tempdir().unwrap();
+        let root_path = tmp_dir.path().to_str().unwrap().to_string();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), root_path);
+
+        let conn = connect_namespace("dir", properties)
+            .execute()
+            .await
+            .expect("Failed to connect to namespace");
+
+        let result = conn.open_table("missing_at_root").execute().await;
+
+        match result {
+            Err(Error::TableNotFound { name, .. }) => {
+                assert_eq!(name, "missing_at_root");
+            }
+            Err(other) => panic!("Expected TableNotFound, got: {:?}", other),
+            Ok(_) => panic!("Expected open_table to fail, but it succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_namespace_create_table_already_exists() {
+        // Regression test for ENT-1235: create_table on an existing table (in default
+        // Create mode) should return TableAlreadyExists, not a generic Runtime/500 error.
+        let tmp_dir = tempdir().unwrap();
+        let root_path = tmp_dir.path().to_str().unwrap().to_string();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), root_path);
+
+        let conn = connect_namespace("dir", properties)
+            .execute()
+            .await
+            .expect("Failed to connect to namespace");
+
+        conn.create_namespace(CreateNamespaceRequest {
+            id: Some(vec!["test_ns".into()]),
+            ..Default::default()
+        })
+        .await
+        .expect("Failed to create namespace");
+
+        // Create the table once.
+        conn.create_table("dup_table", create_test_data())
+            .namespace(vec!["test_ns".into()])
+            .execute()
+            .await
+            .expect("Failed to create table the first time");
+
+        // Try to create it again with the default Create mode.
+        let result = conn
+            .create_table("dup_table", create_test_data())
+            .namespace(vec!["test_ns".into()])
+            .execute()
+            .await;
+
+        match result {
+            Err(Error::TableAlreadyExists { name }) => {
+                assert_eq!(name, "dup_table");
+            }
+            Err(other) => panic!("Expected TableAlreadyExists, got: {:?}", other),
+            Ok(_) => panic!("Expected create_table to fail, but it succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_namespace_create_table_already_exists_at_root() {
+        // Same as above, but at the root namespace.
+        let tmp_dir = tempdir().unwrap();
+        let root_path = tmp_dir.path().to_str().unwrap().to_string();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), root_path);
+
+        let conn = connect_namespace("dir", properties)
+            .execute()
+            .await
+            .expect("Failed to connect to namespace");
+
+        conn.create_table("dup_root", create_test_data())
+            .execute()
+            .await
+            .expect("Failed to create table the first time");
+
+        let result = conn
+            .create_table("dup_root", create_test_data())
+            .execute()
+            .await;
+
+        match result {
+            Err(Error::TableAlreadyExists { name }) => {
+                assert_eq!(name, "dup_root");
+            }
+            Err(other) => panic!("Expected TableAlreadyExists, got: {:?}", other),
+            Ok(_) => panic!("Expected create_table to fail, but it succeeded"),
+        }
     }
 
     #[tokio::test]

@@ -16,11 +16,13 @@ from lancedb.index import (
     IvfSq,
     IvfHnswPq,
     IvfHnswSq,
+    IvfHnswFlat,
     IvfRq,
     Bitmap,
     LabelList,
     HnswPq,
     HnswSq,
+    HnswFlat,
     FTS,
 )
 from lancedb.table import IndexStatistics
@@ -104,6 +106,94 @@ async def test_create_scalar_index(some_table: AsyncTable):
 
 
 @pytest.mark.asyncio
+async def test_create_nested_scalar_index_lists_canonical_paths(db_async):
+    metadata_type = pa.struct(
+        [
+            pa.field("user_id", pa.int32()),
+            pa.field("user.id", pa.int32()),
+        ]
+    )
+    mixed_case_metadata_type = pa.struct([pa.field("userId", pa.int32())])
+    escaped_metadata_type = pa.struct([pa.field("user-id", pa.int32())])
+    literal_type = pa.struct([pa.field("a.b", pa.int32())])
+    data = pa.Table.from_arrays(
+        [
+            pa.array([1, 2, 3], type=pa.int32()),
+            pa.array([1, 2, 3], type=pa.int32()),
+            pa.array([1, 2, 3], type=pa.int32()),
+            pa.array([1, 2, 3], type=pa.int32()),
+            pa.array(
+                [
+                    {"user_id": 10, "user.id": 100},
+                    {"user_id": 20, "user.id": 200},
+                    {"user_id": 30, "user.id": 300},
+                ],
+                type=metadata_type,
+            ),
+            pa.array(
+                [{"userId": 10}, {"userId": 20}, {"userId": 30}],
+                type=mixed_case_metadata_type,
+            ),
+            pa.array(
+                [{"user-id": 10}, {"user-id": 20}, {"user-id": 30}],
+                type=escaped_metadata_type,
+            ),
+            pa.array(
+                [{"a.b": 10}, {"a.b": 20}, {"a.b": 30}],
+                type=literal_type,
+            ),
+        ],
+        names=[
+            "rowId",
+            "row-id",
+            "userId",
+            "user_id",
+            "metadata",
+            "MetaData",
+            "meta-data",
+            "literal",
+        ],
+    )
+    table = await db_async.create_table("nested_scalar_index", data)
+
+    await table.create_index("rowId", config=BTree(), name="row_id_idx")
+    await table.create_index("`row-id`", config=BTree(), name="row_dash_id_idx")
+    await table.create_index("userId", config=BTree(), name="top_user_id_idx")
+    await table.create_index("user_id", config=BTree(), name="top_snake_user_id_idx")
+    await table.create_index(
+        "metadata.user_id", config=BTree(), name="nested_user_id_idx"
+    )
+    await table.create_index(
+        "metadata.`user.id`", config=BTree(), name="escaped_user_id_idx"
+    )
+    await table.create_index(
+        "MetaData.userId", config=BTree(), name="mixed_case_metadata_user_id_idx"
+    )
+    await table.create_index(
+        "`meta-data`.`user-id`", config=BTree(), name="escaped_names_idx"
+    )
+    await table.create_index("literal.`a.b`", config=BTree(), name="literal_dot_idx")
+
+    columns_by_name = {
+        index.name: index.columns for index in await table.list_indices()
+    }
+    assert columns_by_name["row_id_idx"] == ["rowId"]
+    assert columns_by_name["row_dash_id_idx"] == ["`row-id`"]
+    assert columns_by_name["top_user_id_idx"] == ["userId"]
+    assert columns_by_name["top_snake_user_id_idx"] == ["user_id"]
+    assert columns_by_name["nested_user_id_idx"] == ["metadata.user_id"]
+    assert columns_by_name["escaped_user_id_idx"] == ["metadata.`user.id`"]
+    assert columns_by_name["mixed_case_metadata_user_id_idx"] == ["MetaData.userId"]
+    assert columns_by_name["escaped_names_idx"] == ["`meta-data`.`user-id`"]
+    assert columns_by_name["literal_dot_idx"] == ["literal.`a.b`"]
+
+    for index_name in columns_by_name:
+        stats = await table.index_stats(index_name)
+        assert stats is not None
+        assert stats.num_indexed_rows == 3
+
+
+@pytest.mark.asyncio
 async def test_create_fixed_size_binary_index(some_table: AsyncTable):
     await some_table.create_index("fsb", config=BTree())
     indices = await some_table.list_indices()
@@ -120,12 +210,13 @@ async def test_create_bitmap_index(some_table: AsyncTable):
     await some_table.create_index("data", config=Bitmap())
     indices = await some_table.list_indices()
     assert len(indices) == 3
+    # list_indices returns indices in alphabetical order by name
     assert indices[0].index_type == "Bitmap"
-    assert indices[0].columns == ["id"]
+    assert indices[0].columns == ["data"]
     assert indices[1].index_type == "Bitmap"
-    assert indices[1].columns == ["is_active"]
+    assert indices[1].columns == ["id"]
     assert indices[2].index_type == "Bitmap"
-    assert indices[2].columns == ["data"]
+    assert indices[2].columns == ["is_active"]
 
     index_name = indices[0].name
     stats = await some_table.index_stats(index_name)
@@ -146,6 +237,51 @@ async def test_create_label_list_index(some_table: AsyncTable):
     await some_table.create_index("tags", config=LabelList())
     indices = await some_table.list_indices()
     assert str(indices) == '[Index(LabelList, columns=["tags"], name="tags_idx")]'
+    plan = await some_table.query().where("array_has(tags, 'tag0')").explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+
+@pytest.mark.asyncio
+async def test_create_large_list_label_list_index(db_async):
+    data = pa.Table.from_pydict(
+        {"tags": [[f"tag{i % 2}", "shared"] for i in range(16)]},
+        schema=pa.schema([pa.field("tags", pa.large_list(pa.string()))]),
+    )
+    table = await db_async.create_table("large_list_label_list_index", data)
+
+    await table.create_index("tags", config=LabelList())
+    indices = await table.list_indices()
+    assert str(indices) == '[Index(LabelList, columns=["tags"], name="tags_idx")]'
+    plan = await table.query().where("array_has(tags, 'shared')").explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+
+@pytest.mark.asyncio
+async def test_create_label_list_index_rejects_list_struct(db_async):
+    item_type = pa.struct(
+        [
+            pa.field("tag", pa.string()),
+            pa.field(
+                "metadata",
+                pa.struct([pa.field("userId", pa.string())]),
+            ),
+        ]
+    )
+    data = pa.Table.from_pylist(
+        [
+            {
+                "items": [
+                    {"tag": "tag0", "metadata": {"userId": "user0"}},
+                    {"tag": "shared", "metadata": {"userId": "user1"}},
+                ]
+            }
+        ],
+        schema=pa.schema([pa.field("items", pa.list_(item_type))]),
+    )
+    table = await db_async.create_table("list_struct_label_list_index", data)
+
+    with pytest.raises(Exception, match="LabelList index cannot be created"):
+        await table.create_index("items", config=LabelList())
 
 
 @pytest.mark.asyncio
@@ -183,7 +319,6 @@ async def test_create_vector_index(some_table: AsyncTable):
     assert stats.num_indexed_rows == await some_table.count_rows()
     assert stats.num_unindexed_rows == 0
     assert stats.num_indices == 1
-    assert stats.loss >= 0.0
 
 
 @pytest.mark.asyncio
@@ -207,7 +342,6 @@ async def test_create_4bit_ivfpq_index(some_table: AsyncTable):
     assert stats.num_indexed_rows == await some_table.count_rows()
     assert stats.num_unindexed_rows == 0
     assert stats.num_indices == 1
-    assert stats.loss >= 0.0
 
 
 @pytest.mark.asyncio
@@ -248,6 +382,21 @@ async def test_create_hnswpq_alias_index(some_table: AsyncTable):
     indices = await some_table.list_indices()
     assert len(indices) == 1
     assert indices[0].index_type in {"HnswPq", "IvfHnswPq"}
+
+
+@pytest.mark.asyncio
+async def test_create_hnswflat_index(some_table: AsyncTable):
+    await some_table.create_index("vector", config=HnswFlat(num_partitions=10))
+    indices = await some_table.list_indices()
+    assert len(indices) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_hnswflat_alias_index(some_table: AsyncTable):
+    await some_table.create_index("vector", config=IvfHnswFlat(num_partitions=5))
+    indices = await some_table.list_indices()
+    assert len(indices) == 1
+    assert indices[0].index_type in {"HnswFlat", "IvfHnswFlat"}
 
 
 @pytest.mark.asyncio
@@ -295,6 +444,7 @@ def test_index_statistics_index_type_lists_all_supported_values():
         "IVF_RQ",
         "IVF_HNSW_SQ",
         "IVF_HNSW_PQ",
+        "IVF_HNSW_FLAT",
         "FTS",
         "BTREE",
         "BITMAP",

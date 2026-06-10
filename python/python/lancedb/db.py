@@ -8,7 +8,17 @@ from abc import abstractmethod
 from datetime import timedelta
 from pathlib import Path
 import sys
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Union,
+)
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -313,7 +323,7 @@ class DBConnection(EnforceOverrides):
         >>> data = [{"vector": [1.1, 1.2], "lat": 45.5, "long": -122.7},
         ...         {"vector": [0.2, 1.8], "lat": 40.1, "long":  -74.1}]
         >>> db.create_table("my_table", data)
-        LanceTable(name='my_table', version=1, ...)
+        LanceTable(name='my_table', ...)
         >>> db["my_table"].head()
         pyarrow.Table
         vector: fixed_size_list<item: float>[2]
@@ -334,7 +344,7 @@ class DBConnection(EnforceOverrides):
         ...    "long": [-122.7, -74.1]
         ... })
         >>> db.create_table("table2", data)
-        LanceTable(name='table2', version=1, ...)
+        LanceTable(name='table2', ...)
         >>> db["table2"].head()
         pyarrow.Table
         vector: fixed_size_list<item: float>[2]
@@ -357,7 +367,7 @@ class DBConnection(EnforceOverrides):
         ...   pa.field("long", pa.float32())
         ... ])
         >>> db.create_table("table3", data, schema = custom_schema)
-        LanceTable(name='table3', version=1, ...)
+        LanceTable(name='table3', ...)
         >>> db["table3"].head()
         pyarrow.Table
         vector: fixed_size_list<item: float>[2]
@@ -391,7 +401,7 @@ class DBConnection(EnforceOverrides):
         ...     pa.field("price", pa.float32()),
         ... ])
         >>> db.create_table("table4", make_batches(), schema=schema)
-        LanceTable(name='table4', version=1, ...)
+        LanceTable(name='table4', ...)
 
         """
         raise NotImplementedError
@@ -406,6 +416,8 @@ class DBConnection(EnforceOverrides):
         namespace_path: Optional[List[str]] = None,
         storage_options: Optional[Dict[str, str]] = None,
         index_cache_size: Optional[int] = None,
+        branch: Optional[str] = None,
+        version: Optional[int] = None,
     ) -> Table:
         """Open a Lance Table in the database.
 
@@ -434,6 +446,14 @@ class DBConnection(EnforceOverrides):
             connection will be inherited by the table, but can be overridden here.
             See available options at
             <https://docs.lancedb.com/storage/>
+        branch: str, optional
+            If provided, open a handle scoped to this branch instead of the
+            default branch. Reads and writes operate in the branch's context.
+        version: int, optional
+            If provided, open the table pinned to this version, producing a
+            read-only handle. Composes with ``branch``: when both are given,
+            opens that branch at the version; otherwise opens ``main`` at the
+            version. Call ``checkout_latest`` to return to a writable state.
 
         Returns
         -------
@@ -568,15 +588,15 @@ class LanceDBConnection(DBConnection):
     >>> db = lancedb.connect("./.lancedb")
     >>> db.create_table("my_table", data=[{"vector": [1.1, 1.2], "b": 2},
     ...                                   {"vector": [0.5, 1.3], "b": 4}])
-    LanceTable(name='my_table', version=1, ...)
+    LanceTable(name='my_table', ...)
     >>> db.create_table("another_table", data=[{"vector": [0.4, 0.4], "b": 6}])
-    LanceTable(name='another_table', version=1, ...)
+    LanceTable(name='another_table', ...)
     >>> sorted(db.table_names())
     ['another_table', 'my_table']
     >>> len(db)
     2
     >>> db["my_table"]
-    LanceTable(name='my_table', version=1, ...)
+    LanceTable(name='my_table', ...)
     >>> "my_table" in db
     True
     >>> db.drop_table("my_table")
@@ -590,8 +610,13 @@ class LanceDBConnection(DBConnection):
         read_consistency_interval: Optional[timedelta] = None,
         storage_options: Optional[Dict[str, str]] = None,
         session: Optional[Session] = None,
+        manifest_enabled: bool = False,
+        namespace_client_properties: Optional[Dict[str, str]] = None,
         _inner: Optional[LanceDbConnection] = None,
     ):
+        self.storage_options = storage_options
+        self._manifest_enabled = manifest_enabled
+        self._namespace_client_properties = namespace_client_properties
         if _inner is not None:
             self._conn = _inner
             self._cached_namespace_client = None
@@ -633,6 +658,8 @@ class LanceDBConnection(DBConnection):
                 None,
                 storage_options,
                 session,
+                manifest_enabled,
+                namespace_client_properties,
             )
 
         # TODO: It would be nice if we didn't store self.storage_options but it is
@@ -640,7 +667,6 @@ class LanceDBConnection(DBConnection):
         # work because some paths like LanceDBConnection.from_inner will lose the
         # storage_options.  Also, this class really shouldn't be holding any state
         # beyond _conn.
-        self.storage_options = storage_options
         self._conn = AsyncConnection(LOOP.run(do_connect()))
         self._cached_namespace_client: Optional[LanceNamespace] = None
 
@@ -677,6 +703,8 @@ class LanceDBConnection(DBConnection):
                 "connection_type": "local",
                 "uri": self.uri,
                 "storage_options": self.storage_options,
+                "manifest_enabled": self._manifest_enabled,
+                "namespace_client_properties": self._namespace_client_properties,
                 "read_consistency_interval_seconds": (
                     rci.total_seconds() if rci else None
                 ),
@@ -839,11 +867,20 @@ class LanceDBConnection(DBConnection):
             )
         )
 
+    def _all_table_names(self) -> Generator[str, None, None]:
+        page_token = None
+        while True:
+            response = self.list_tables(page_token=page_token)
+            yield from response.tables
+            page_token = response.page_token
+            if not page_token:
+                return
+
     def __len__(self) -> int:
-        return len(self.table_names())
+        return sum(1 for _ in self._all_table_names())
 
     def __contains__(self, name: str) -> bool:
-        return name in self.table_names()
+        return name in self._all_table_names()
 
     @override
     def create_table(
@@ -931,6 +968,8 @@ class LanceDBConnection(DBConnection):
         namespace_path: Optional[List[str]] = None,
         storage_options: Optional[Dict[str, str]] = None,
         index_cache_size: Optional[int] = None,
+        branch: Optional[str] = None,
+        version: Optional[int] = None,
     ) -> LanceTable:
         """Open a table in the database.
 
@@ -941,6 +980,14 @@ class LanceDBConnection(DBConnection):
         namespace_path: List[str], optional
             The namespace to open the table from.  When non-empty, the
             table is resolved through the directory namespace client.
+        branch: str, optional
+            If provided, open a handle scoped to this branch instead of the
+            default branch. Reads and writes operate in the branch's context.
+        version: int, optional
+            If provided, open the table pinned to this version, producing a
+            read-only handle. Composes with ``branch``: when both are given,
+            opens that branch at the version; otherwise opens ``main`` at the
+            version. Call ``checkout_latest`` to return to a writable state.
 
         Returns
         -------
@@ -960,20 +1007,26 @@ class LanceDBConnection(DBConnection):
             )
 
         if namespace_path:
-            return self._namespace_conn().open_table(
+            tbl = self._namespace_conn().open_table(
+                name,
+                namespace_path=namespace_path,
+                storage_options=storage_options,
+                index_cache_size=index_cache_size,
+            )
+        else:
+            tbl = LanceTable.open(
+                self,
                 name,
                 namespace_path=namespace_path,
                 storage_options=storage_options,
                 index_cache_size=index_cache_size,
             )
 
-        return LanceTable.open(
-            self,
-            name,
-            namespace_path=namespace_path,
-            storage_options=storage_options,
-            index_cache_size=index_cache_size,
-        )
+        if branch is not None:
+            tbl = tbl.branches.checkout(branch, version)
+        elif version is not None:
+            tbl.checkout(version)
+        return tbl
 
     def clone_table(
         self,
@@ -1614,6 +1667,8 @@ class AsyncConnection(object):
         location: Optional[str] = None,
         namespace_client: Optional[Any] = None,
         managed_versioning: Optional[bool] = None,
+        branch: Optional[str] = None,
+        version: Optional[int] = None,
     ) -> AsyncTable:
         """Open a Lance Table in the database.
 
@@ -1649,6 +1704,14 @@ class AsyncConnection(object):
         managed_versioning: bool, optional
             Whether managed versioning is enabled for this table. If provided,
             avoids a redundant describe_table call when namespace_client is set.
+        branch: str, optional
+            If provided, open a handle scoped to this branch instead of the
+            default branch. Reads and writes operate in the branch's context.
+        version: int, optional
+            If provided, open the table pinned to this version, producing a
+            read-only handle. Composes with ``branch``: when both are given,
+            opens that branch at the version; otherwise opens ``main`` at the
+            version. Call ``checkout_latest`` to return to a writable state.
 
         Returns
         -------
@@ -1665,7 +1728,14 @@ class AsyncConnection(object):
             namespace_client=namespace_client,
             managed_versioning=managed_versioning,
         )
-        return AsyncTable(table)
+        tbl = AsyncTable(table)
+        # "main" is the default branch, so treat it as no branch: remote rejects
+        # every branch checkout (even "main"), and the version still applies.
+        if branch is not None and branch != "main":
+            tbl = await tbl.branches.checkout(branch, version)
+        elif version is not None:
+            await tbl.checkout(version)
+        return tbl
 
     async def clone_table(
         self,

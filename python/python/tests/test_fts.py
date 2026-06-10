@@ -15,7 +15,10 @@
 #  limitations under the License.
 import os
 import random
+import shutil
 from unittest import mock
+from pathlib import Path
+import zipfile
 
 import lancedb as ldb
 from lancedb.db import DBConnection
@@ -26,6 +29,7 @@ from lancedb.query import (
     MultiMatchQuery,
     PhraseQuery,
     BooleanQuery,
+    ColumnOrdering,
     Occur,
     LanceFtsQueryBuilder,
 )
@@ -35,6 +39,8 @@ import pandas as pd
 import pytest
 import pytest_asyncio
 from utils import exception_output
+
+TEST_LANGUAGE_MODEL_HOME = Path(__file__).parent / "models"
 
 
 @pytest.fixture
@@ -87,6 +93,39 @@ def table(tmp_path) -> ldb.table.LanceTable:
         ),
     )
     return table
+
+
+@pytest.fixture
+def language_model_home(monkeypatch, tmp_path):
+    model_home = tmp_path / "language-models"
+    shutil.copytree(TEST_LANGUAGE_MODEL_HOME, model_home)
+    monkeypatch.setenv("LANCE_LANGUAGE_MODEL_HOME", str(model_home))
+    return model_home
+
+
+@pytest.fixture
+def lindera_ipadic(language_model_home):
+    model_path = language_model_home / "lindera" / "ipadic"
+    extracted_model = model_path / "main"
+    config_path = model_path / "config.yml"
+
+    if extracted_model.exists():
+        shutil.rmtree(extracted_model)
+
+    with zipfile.ZipFile(model_path / "main.zip", "r") as zip_ref:
+        zip_ref.extractall(model_path)
+    config_path.write_text(
+        "segmenter:\n"
+        '  mode: "normal"\n'
+        f'  dictionary: "{extracted_model.resolve().as_posix()}"\n',
+        encoding="utf-8",
+    )
+
+    try:
+        yield
+    finally:
+        if extracted_model.exists():
+            shutil.rmtree(extracted_model)
 
 
 @pytest_asyncio.fixture
@@ -176,11 +215,12 @@ def test_reject_legacy_tantivy_index(table):
 
 @pytest.mark.parametrize("with_position", [True, False])
 def test_create_inverted_index(table, with_position):
-    table.create_fts_index(
-        "text",
-        with_position=with_position,
-        name="custom_fts_index",
-    )
+    with pytest.warns(DeprecationWarning, match="create_fts_index"):
+        table.create_fts_index(
+            "text",
+            with_position=with_position,
+            name="custom_fts_index",
+        )
     indices = table.list_indices()
     fts_indices = [i for i in indices if i.index_type == "FTS"]
     assert any(i.name == "custom_fts_index" for i in fts_indices)
@@ -461,6 +501,36 @@ async def test_search_fts_specify_column_async(async_table):
         pass
 
 
+def test_search_order_by_descending(table):
+    table.create_fts_index("text")
+    rows = (
+        table.search("puppy")
+        .order_by([ColumnOrdering(column_name="count", ascending=False)])
+        .limit(20)
+        .select(["text", "count"])
+        .to_list()
+    )
+
+    for r in rows:
+        assert "puppy" in r["text"]
+    assert sorted(rows, key=lambda x: x["count"], reverse=True) == rows
+
+
+def test_search_order_by_ascending(table):
+    table.create_fts_index("text")
+    rows = (
+        table.search("puppy")
+        .order_by([ColumnOrdering(column_name="count", ascending=True)])
+        .limit(20)
+        .select(["text", "count"])
+        .to_list()
+    )
+
+    for r in rows:
+        assert "puppy" in r["text"]
+    assert sorted(rows, key=lambda x: x["count"]) == rows
+
+
 def test_create_index_from_table(tmp_path, table):
     table.create_fts_index("text")
     df = table.search("puppy").limit(5).select(["text"]).to_pandas()
@@ -494,8 +564,111 @@ def test_create_index_multiple_columns(tmp_path, table):
 
 
 def test_nested_schema(tmp_path, table):
-    with pytest.raises(ValueError, match="top-level fields"):
-        table.create_fts_index("nested.text")
+    table.create_fts_index("nested.text", with_position=True)
+    indices = table.list_indices()
+    assert len(indices) == 1
+    assert indices[0].index_type == "FTS"
+    assert indices[0].columns == ["nested.text"]
+
+    results = (
+        table.search("puppy", query_type="fts", fts_columns="nested.text")
+        .limit(5)
+        .to_list()
+    )
+    assert len(results) > 0
+    assert all("puppy" in row["nested"]["text"] for row in results)
+
+    results = table.search(MatchQuery("puppy", "nested.text")).limit(5).to_list()
+    assert len(results) > 0
+    assert all("puppy" in row["nested"]["text"] for row in results)
+
+    phrase_results = (
+        table.search(PhraseQuery("puppy runs", "nested.text")).limit(5).to_list()
+    )
+    assert len(phrase_results) > 0
+    assert all("puppy runs" in row["nested"]["text"] for row in phrase_results)
+
+    hybrid_results = (
+        table.search(query_type="hybrid", fts_columns="nested.text")
+        .vector([0 for _ in range(128)])
+        .text("puppy")
+        .limit(5)
+        .to_list()
+    )
+    assert len(hybrid_results) > 0
+
+
+@pytest.mark.asyncio
+async def test_nested_schema_async(async_table):
+    await async_table.create_index("nested.text", config=FTS(with_position=True))
+    indices = await async_table.list_indices()
+    assert len(indices) == 1
+    assert indices[0].index_type == "FTS"
+    assert indices[0].columns == ["nested.text"]
+
+    results = await (
+        async_table.query()
+        .nearest_to_text("puppy", columns="nested.text")
+        .limit(5)
+        .to_list()
+    )
+    assert len(results) > 0
+    assert all("puppy" in row["nested"]["text"] for row in results)
+
+    results = await (
+        async_table.query()
+        .nearest_to_text(MatchQuery("puppy", "nested.text"))
+        .limit(5)
+        .to_list()
+    )
+    assert len(results) > 0
+    assert all("puppy" in row["nested"]["text"] for row in results)
+
+    phrase_results = await (
+        async_table.query()
+        .nearest_to_text(PhraseQuery("puppy runs", "nested.text"))
+        .limit(5)
+        .to_list()
+    )
+    assert len(phrase_results) > 0
+    assert all("puppy runs" in row["nested"]["text"] for row in phrase_results)
+
+    hybrid_results = await (
+        async_table.query()
+        .nearest_to([0 for _ in range(128)])
+        .nearest_to_text("puppy", columns="nested.text")
+        .limit(5)
+        .to_list()
+    )
+    assert len(hybrid_results) > 0
+
+
+def test_nested_schema_rejects_invalid_fts_fields(tmp_path):
+    db = ldb.connect(tmp_path)
+    data = pa.table(
+        {
+            "payload": pa.array(
+                [
+                    {"text": "puppy runs", "count": 1},
+                    {"text": "car drives", "count": 2},
+                ]
+            ),
+            "vector": pa.array(
+                [[0.1, 0.1], [0.2, 0.2]],
+                type=pa.list_(pa.float32(), list_size=2),
+            ),
+        }
+    )
+    table = db.create_table("test", data=data)
+
+    with pytest.raises(ValueError, match="FTS index cannot be created.*payload"):
+        table.create_fts_index("payload")
+
+    with pytest.raises(ValueError, match="FTS index cannot be created.*count"):
+        table.create_fts_index("payload.count")
+
+    with pytest.raises(ValueError, match="Field path `payload.missing` not found"):
+        table.create_fts_index("payload.missing")
 
 
 def test_search_index_with_filter(table):
@@ -682,6 +855,90 @@ def test_fts_ngram(mem_db: DBConnection):
     results = table.search("la", query_type="fts").limit(10).to_list()
     assert len(results) == 2
     assert set(r["text"] for r in results) == {"lance database", "lance is cool"}
+
+
+def test_fts_jieba_tokenizer(mem_db: DBConnection, language_model_home):
+    data = pa.table({"text": ["我们都有光明的前途", "光明的前途"]})
+    table = mem_db.create_table("test_jieba", data=data)
+    table.create_fts_index(
+        "text",
+        base_tokenizer="jieba/default",
+        stem=False,
+        remove_stop_words=False,
+        ascii_folding=False,
+    )
+
+    results = table.search("我们", query_type="fts").limit(10).to_list()
+    assert [row["text"] for row in results] == ["我们都有光明的前途"]
+
+
+def test_fts_jieba_missing_language_model_note(
+    mem_db: DBConnection, monkeypatch, tmp_path
+):
+    missing_root = tmp_path / "missing-language-models"
+    monkeypatch.setenv("LANCE_LANGUAGE_MODEL_HOME", str(missing_root))
+    table = mem_db.create_table(
+        "test_missing_jieba_model",
+        data=pa.table({"text": ["我们都有光明的前途"]}),
+    )
+
+    with pytest.raises((ValueError, RuntimeError)) as e:
+        table.create_fts_index(
+            "text",
+            base_tokenizer="jieba/default",
+            stem=False,
+            remove_stop_words=False,
+            ascii_folding=False,
+        )
+
+    output = exception_output(e)
+    assert "Invalid directory path:" in output
+    assert "LANCE_LANGUAGE_MODEL_HOME" in output
+    assert "jieba/default" in output
+
+
+@pytest.mark.asyncio
+async def test_fts_jieba_missing_language_model_note_async(monkeypatch, tmp_path):
+    missing_root = tmp_path / "missing-language-models"
+    monkeypatch.setenv("LANCE_LANGUAGE_MODEL_HOME", str(missing_root))
+    db = await ldb.connect_async(tmp_path / "async-db")
+    table = await db.create_table(
+        "test_missing_jieba_model_async",
+        data=pa.table({"text": ["我们都有光明的前途"]}),
+    )
+
+    with pytest.raises((ValueError, RuntimeError)) as e:
+        await table.create_index(
+            "text",
+            config=FTS(
+                base_tokenizer="jieba/default",
+                stem=False,
+                remove_stop_words=False,
+                ascii_folding=False,
+            ),
+        )
+
+    output = exception_output(e)
+    assert "Invalid directory path:" in output
+    assert "LANCE_LANGUAGE_MODEL_HOME" in output
+    assert "jieba/default" in output
+
+
+def test_fts_lindera_tokenizer(
+    mem_db: DBConnection, language_model_home, lindera_ipadic
+):
+    data = pa.table({"text": ["成田国際空港", "東京国際空港", "羽田空港"]})
+    table = mem_db.create_table("test_lindera", data=data)
+    table.create_fts_index(
+        "text",
+        base_tokenizer="lindera/ipadic",
+        stem=False,
+        remove_stop_words=False,
+        ascii_folding=False,
+    )
+
+    results = table.search("成田", query_type="fts").limit(10).to_list()
+    assert [row["text"] for row in results] == ["成田国際空港"]
 
 
 def test_fts_query_to_json():
