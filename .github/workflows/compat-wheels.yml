@@ -1,0 +1,127 @@
+name: Compat Wheels (build only)
+
+# Builds pre-Haswell-safe `lancedb` wheels for all platforms from
+# fork/compat-deploy. The x86-64-v2 baseline comes from .cargo/config.toml (no
+# RUSTFLAGS env), and the embedded lance crate (tobocop2/lance
+# v9.0.0-beta.8-compat) does runtime SIMD dispatch. Wheels are versioned
+# `<base>+compat` and uploaded as artifacts only; the tobocop2/wheels hub turns
+# them into a PEP 503 index.
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [build-compat-wheels]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            arm: "false"
+            runner: ubuntu-latest
+          - platform: aarch64
+            arm: "true"
+            runner: ubuntu-24.04-arm   # native arm64: avoids cross-compile (ring/yum) breakage
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, lfs: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Stamp +compat version
+        run: python .github/scripts/compat_version.py
+      - uses: ./.github/workflows/build_linux_wheel
+        with:
+          python-minor-version: "10"
+          args: "--release --strip"
+          arm-build: ${{ matrix.arm }}
+          manylinux: "2_17"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compat-wheels-linux-${{ matrix.platform }}
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  mac:
+    name: mac ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, lfs: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Stamp +compat version
+        run: python .github/scripts/compat_version.py
+      - uses: ./.github/workflows/build_mac_wheel
+        with:
+          python-minor-version: "10"
+          args: "--release --strip --target ${{ matrix.target }} --features fp16kernels"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compat-wheels-mac-${{ matrix.target }}
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  windows:
+    name: windows x86_64
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, lfs: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Stamp +compat version
+        shell: bash
+        run: python .github/scripts/compat_version.py
+      - uses: ./.github/workflows/build_windows_wheel
+        with:
+          python-minor-version: "10"
+          args: "--release --strip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compat-wheels-windows
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  smoke:
+    name: smoke (import + vector round-trip)
+    needs: [linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.10" }
+      - uses: actions/download-artifact@v4
+        with:
+          name: compat-wheels-linux-x86_64
+          path: dist
+      - name: Install the compat wheel and round-trip
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dist/lancedb-*x86_64*.whl pyarrow numpy
+          python - <<'PY'
+          import lancedb, pyarrow as pa
+          db = lancedb.connect("/tmp/ldbtest")
+          t = db.create_table("t", data=[{"vector": [0.1, 0.2], "id": 1},
+                                          {"vector": [0.3, 0.4], "id": 2}])
+          got = t.search([0.1, 0.2]).limit(1).to_list()
+          assert got and got[0]["id"] == 1, got
+          print("compat wheel OK:", got)
+          PY

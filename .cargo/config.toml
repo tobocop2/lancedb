@@ -28,11 +28,16 @@ rustflags = [
     "-Aclippy::wildcard_dependencies",
 ]
 
+# COMPAT BUILD: x86_64 baseline lowered from haswell to x86-64-v2 (SSE4.2, no
+# AVX2/FMA/F16C) and the forced AVX features removed, so the compiler does not
+# bake AVX2 into the binary. The embedded lance crate (tobocop2/lance
+# v9.0.0-beta.8-compat) selects AVX2/AVX-512 kernels at runtime, so modern CPUs
+# stay fast while pre-Haswell hosts no longer SIGILL at import.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma,+f16c"]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
 
 [target.x86_64-unknown-linux-musl]
-rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=-crt-static,+avx2,+fma,+f16c"]
+rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "target-feature=-crt-static"]
 
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"
@@ -41,10 +46,16 @@ rustflags = ["-C", "target-feature=-crt-static"]
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m1", "-C", "target-feature=+neon,+fp16,+fhm,+dotprod"]
 
+# COMPAT BUILD: macOS x86_64 had no explicit baseline (defaulted to generic v1).
+# Pin x86-64-v2 to match the Linux/Windows compat baseline.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
 # Not all Windows systems have the C runtime installed, so this avoids library
 # not found errors on systems that are missing it.
+# COMPAT BUILD: add the x86-64-v2 baseline alongside the static-CRT flag.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-Ctarget-feature=+crt-static"]
+rustflags = ["-Ctarget-feature=+crt-static", "-C", "target-cpu=x86-64-v2"]
 
 # Experimental target for Arm64 Windows
 [target.aarch64-pc-windows-msvc]
