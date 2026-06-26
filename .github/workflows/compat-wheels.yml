@@ -1,11 +1,13 @@
 name: Compat Wheels (build only)
 
-# Builds pre-Haswell-safe `lancedb` wheels for all platforms from
-# fork/compat-deploy. The x86-64-v2 baseline comes from .cargo/config.toml (no
-# RUSTFLAGS env), and the embedded lance crate (tobocop2/lance
-# v9.0.0-beta.8-compat) does runtime SIMD dispatch. Wheels are versioned
-# `<base>+compat` and uploaded as artifacts only; the tobocop2/wheels hub turns
-# them into a PEP 503 index.
+# Builds pre-Haswell-safe `lancedb` wheels from fork/compat-deploy, for the x86_64
+# platforms (linux/mac/windows) where the SIGILL actually happens. aarch64 is
+# intentionally excluded: ARM never had the AVX2-baking problem, so a compat wheel
+# there is pointless, and the fat-LTO link OOMs the free arm runners anyway.
+# The x86-64-v2 baseline comes from .cargo/config.toml (no RUSTFLAGS env); the
+# embedded lance crate (tobocop2/lance v9.0.0-beta.8-compat) does runtime SIMD
+# dispatch. Wheels are versioned `<base>+compat`, uploaded as artifacts; the
+# tobocop2/wheels hub turns them into a PEP 503 index.
 
 on:
   workflow_dispatch:
@@ -17,18 +19,8 @@ permissions:
 
 jobs:
   linux:
-    name: linux ${{ matrix.platform }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: x86_64
-            arm: "false"
-            runner: ubuntu-latest
-          - platform: aarch64
-            arm: "true"
-            runner: ubuntu-24.04-arm   # native arm64: avoids cross-compile (ring/yum) breakage
+    name: linux x86_64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0, lfs: true }
@@ -40,27 +32,19 @@ jobs:
         with:
           python-minor-version: "10"
           args: "--release --strip"
-          arm-build: ${{ matrix.arm }}
+          arm-build: "false"
           manylinux: "2_17"
       - uses: actions/upload-artifact@v4
         with:
-          name: compat-wheels-linux-${{ matrix.platform }}
+          name: compat-wheels-linux-x86_64
           path: target/wheels/*.whl
           if-no-files-found: error
 
   mac:
-    name: mac ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    name: mac x86_64
+    runs-on: macos-15-intel
     env:
       MACOSX_DEPLOYMENT_TARGET: "10.15"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-          - target: aarch64-apple-darwin
-            runner: macos-14
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0, lfs: true }
@@ -71,10 +55,10 @@ jobs:
       - uses: ./.github/workflows/build_mac_wheel
         with:
           python-minor-version: "10"
-          args: "--release --strip --target ${{ matrix.target }} --features fp16kernels"
+          args: "--release --strip --target x86_64-apple-darwin --features fp16kernels"
       - uses: actions/upload-artifact@v4
         with:
-          name: compat-wheels-mac-${{ matrix.target }}
+          name: compat-wheels-mac-x86_64
           path: target/wheels/*.whl
           if-no-files-found: error
 
