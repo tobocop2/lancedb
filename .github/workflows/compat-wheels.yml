@@ -1,0 +1,111 @@
+name: Compat Wheels (build only)
+
+# Builds pre-Haswell-safe `lancedb` wheels from fork/compat-deploy, for the x86_64
+# platforms (linux/mac/windows) where the SIGILL actually happens. aarch64 is
+# intentionally excluded: ARM never had the AVX2-baking problem, so a compat wheel
+# there is pointless, and the fat-LTO link OOMs the free arm runners anyway.
+# The x86-64-v2 baseline comes from .cargo/config.toml (no RUSTFLAGS env); the
+# embedded lance crate (tobocop2/lance v9.0.0-beta.8-compat) does runtime SIMD
+# dispatch. Wheels are versioned `<base>+compat`, uploaded as artifacts; the
+# tobocop2/wheels hub turns them into a PEP 503 index.
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [build-compat-wheels]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, lfs: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Stamp +compat version
+        run: python .github/scripts/compat_version.py
+      - uses: ./.github/workflows/build_linux_wheel
+        with:
+          python-minor-version: "10"
+          args: "--release --strip"
+          arm-build: "false"
+          manylinux: "2_17"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compat-wheels-linux-x86_64
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  mac:
+    name: mac x86_64
+    runs-on: macos-15-intel
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, lfs: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Stamp +compat version
+        run: python .github/scripts/compat_version.py
+      - uses: ./.github/workflows/build_mac_wheel
+        with:
+          python-minor-version: "10"
+          args: "--release --strip --target x86_64-apple-darwin --features fp16kernels"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compat-wheels-mac-x86_64
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  windows:
+    name: windows x86_64
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, lfs: true }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Stamp +compat version
+        shell: bash
+        run: python .github/scripts/compat_version.py
+      - uses: ./.github/workflows/build_windows_wheel
+        with:
+          python-minor-version: "10"
+          args: "--release --strip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compat-wheels-windows
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  smoke:
+    name: smoke (import + vector round-trip)
+    needs: [linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.10" }
+      - uses: actions/download-artifact@v4
+        with:
+          name: compat-wheels-linux-x86_64
+          path: dist
+      - name: Install the compat wheel and round-trip
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dist/lancedb-*x86_64*.whl pyarrow numpy
+          python - <<'PY'
+          import lancedb, pyarrow as pa
+          db = lancedb.connect("/tmp/ldbtest")
+          t = db.create_table("t", data=[{"vector": [0.1, 0.2], "id": 1},
+                                          {"vector": [0.3, 0.4], "id": 2}])
+          got = t.search([0.1, 0.2]).limit(1).to_list()
+          assert got and got[0]["id"] == 1, got
+          print("compat wheel OK:", got)
+          PY
