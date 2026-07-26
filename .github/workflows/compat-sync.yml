@@ -1,0 +1,67 @@
+name: Compat Sync (rebase onto upstream)
+
+# Rebases the lance + lancedb compat branches onto their latest upstream main and
+# re-points the lance deps, so the next compat-wheels build tracks upstream.
+# Fail-closed: a rebase conflict (upstream refactored a patched file) aborts and
+# leaves the branches untouched, so the previous good state stays buildable.
+# Needs secrets.SYNC_PAT (repo + workflow scope) to push to both forks.
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [compat-sync]
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Rebase lance fork onto upstream main, re-tag -compat
+        id: lance
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/tobocop2/lance.git" lance
+          cd lance
+          git config user.name tobocop2
+          git config user.email 5562156+tobocop2@users.noreply.github.com
+          git remote add upstream https://github.com/lance-format/lance.git
+          git fetch upstream --quiet
+          git switch compat/deploy
+          if ! git rebase upstream/main; then
+            git rebase --abort || true
+            echo "::error::lance rebase onto upstream/main conflicted (patched file changed upstream)"; exit 3
+          fi
+          ver=$(python -c "import re,pathlib; print(re.search(r'^version = \"([^\"]+)\"', pathlib.Path('Cargo.toml').read_text(), re.M).group(1))")
+          echo "lance_tag=v${ver}-compat" >> "$GITHUB_OUTPUT"
+          git tag -f "v${ver}-compat"
+          git push -f origin compat/deploy "v${ver}-compat"
+
+      - name: Rebase lancedb fork onto upstream main, repoint lance deps
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/tobocop2/lancedb.git" lancedb
+          cd lancedb
+          git config user.name tobocop2
+          git config user.email 5562156+tobocop2@users.noreply.github.com
+          git remote add upstream https://github.com/lancedb/lancedb.git
+          git fetch upstream --quiet
+          git switch fork/compat-deploy
+          if ! git rebase upstream/main; then
+            git rebase --abort || true
+            echo "::error::lancedb rebase onto upstream/main conflicted (likely the lance version pin moved)"; exit 3
+          fi
+          # Bump the lance fork tag (and matching version requirement) if it changed.
+          python .github/scripts/repoint_lance.py Cargo.toml "${{ steps.lance.outputs.lance_tag }}"
+          if ! git diff --quiet Cargo.toml; then
+            git commit -am "build: bump lance deps to ${{ steps.lance.outputs.lance_tag }}"
+          fi
+          git push -f origin fork/compat-deploy
