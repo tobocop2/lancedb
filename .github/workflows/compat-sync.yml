@@ -1,0 +1,39 @@
+name: Compat Sync (rebase onto upstream)
+
+# Rebases the lancedb compat branch onto the latest upstream main, so the next
+# compat-wheels build tracks upstream. Only the lancedb fork is rebased: the
+# upstream lance 12 pin carries runtime SIMD dispatch (lance-format/lance#6630),
+# so there is no lance fork to rebase or repoint.
+# Fail-closed: a rebase conflict (upstream refactored a patched file) aborts and
+# leaves the branch untouched, so the previous good state stays buildable.
+# Needs secrets.SYNC_PAT (repo + workflow scope) to push to the fork.
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [compat-sync]
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebase lancedb fork onto upstream main
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/tobocop2/lancedb.git" lancedb
+          cd lancedb
+          git config user.name tobocop2
+          git config user.email 5562156+tobocop2@users.noreply.github.com
+          git remote add upstream https://github.com/lancedb/lancedb.git
+          git fetch upstream --quiet
+          git switch fork/compat-deploy
+          if ! git rebase upstream/main; then
+            git rebase --abort || true
+            echo "::error::lancedb rebase onto upstream/main conflicted (patched file changed upstream)"; exit 3
+          fi
+          git push -f origin fork/compat-deploy
